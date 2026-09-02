@@ -1,0 +1,14 @@
+{
+  "name": "fit-to-sqlite",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "fit-to-sqlite": "./src/cli.ts" },
+  "dependencies": {
+    "@garmin/fitsdk": "^21.214.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}

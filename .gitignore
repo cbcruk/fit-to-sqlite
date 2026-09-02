@@ -1,0 +1,13 @@
+node_modules/
+
+# 생성물
+*.db
+*.db-wal
+*.db-shm
+fixture.fit
+
+# 개인 활동 데이터 (GPS 좌표 포함)
+*.fit
+!fixture.fit.example
+
+files.zip
