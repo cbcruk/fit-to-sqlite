@@ -51,16 +51,28 @@ export function ingest(db: DatabaseSync, buf: Uint8Array, filename: string): Ing
     )
 
     let seq = 0
+    // SDK 의 read() 는 디코드 전체를 try/catch 로 감싸고 잡은 걸 errors 에
+    // 담은 뒤 finally 에서 정상 반환한다. 리스너에서 던진 것도 똑같이 삼켜
+    // 지므로, INSERT 실패가 '디코드 경고' 로 둔갑해 반쪽 파일이 커밋된다.
+    // 우리 예외는 우리가 잡아 두고 read() 가 끝난 뒤 다시 던진다.
+    let writeError: unknown
     const decoder = new Decoder(Stream.fromBuffer(buf))
     const { profileVersion, errors } = decoder.read({
       // 타입별로 묶인 messages 트리는 파일 내 상대 순서를 잃는다.
       // listener 로 받으면 lap→session 같은 원래 순서가 seq 에 보존된다.
       mesgListener: (mesgNum, mesg) => {
-        const kind = MESG_NAME[mesgNum] ?? `unknown_${mesgNum}`
-        const data = normalize(kind, mesg)
-        insertMesg.run(fileId, seq++, kind, epochOf(data), JSON.stringify(data))
+        // 한 번 실패하면 남은 메시지는 어차피 롤백되므로 건너뛴다.
+        if (writeError !== undefined) return
+        try {
+          const kind = MESG_NAME[mesgNum] ?? `unknown_${mesgNum}`
+          const data = normalize(kind, mesg)
+          insertMesg.run(fileId, seq++, kind, epochOf(data), JSON.stringify(data))
+        } catch (err) {
+          writeError = err ?? new Error('알 수 없는 적재 실패')
+        }
       },
     })
+    if (writeError !== undefined) throw writeError
 
     db.prepare('UPDATE fit_file SET profile_version = ? WHERE id = ?').run(
       `${profileVersion.major}.${profileVersion.minor}`,
