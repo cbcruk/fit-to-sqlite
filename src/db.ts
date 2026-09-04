@@ -36,3 +36,19 @@ export function openDb(path: string): DatabaseSync {
   db.exec(SCHEMA)
   return db
 }
+
+/**
+ * node:sqlite 에는 bun:sqlite / better-sqlite3 의 db.transaction() 헬퍼가
+ * 없다. BEGIN/COMMIT 을 직접 건다. 예외가 나면 ROLLBACK 하고 다시 던진다.
+ */
+export function tx<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec('BEGIN')
+  try {
+    const r = fn()
+    db.exec('COMMIT')
+    return r
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+}

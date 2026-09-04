@@ -138,7 +138,7 @@ SDK의 `.d.ts` 가 확장자 없는 상대 import(`export * from './types/decode
 
 `bun:sqlite` / `better-sqlite3` 에서 옮겨올 때 걸리는 곳이 넷 있다.
 
-`.transaction()` 헬퍼가 없다. `src/ingest.ts` 에 `BEGIN`/`COMMIT`/`ROLLBACK` 을 직접 거는 래퍼를 뒀다. `db.isTransaction` 으로 진행 여부를 볼 수 있다.
+`.transaction()` 헬퍼가 없다. `src/db.ts` 에 `BEGIN`/`COMMIT`/`ROLLBACK` 을 직접 거는 `tx()` 를 뒀다. `db.isTransaction` 으로 진행 여부를 볼 수 있다.
 
 `.pragma()` 헬퍼도 없다. `db.exec('PRAGMA journal_mode = WAL')` 로 직접 건다. `synchronous` 는 연결별 설정이라 `sqlite3` CLI 로 확인하면 CLI 자신의 기본값이 보인다 — 검증하려면 같은 연결 안에서 읽어야 한다. `journal_mode` 만 파일 헤더에 남는다. `foreign_keys` 는 `DatabaseSync` 가 기본으로 켜므로 따로 걸지 않는다.
 
@@ -152,6 +152,16 @@ db.prepare('SELECT id FROM fit_file WHERE sha256 = ?').get(sha) as { id: number 
 ```
 
 바인딩 가능한 값은 `null`/number/bigint/string/`Uint8Array` 뿐이다. boolean 은 던진다 — `integrity_ok` 를 `1`/`0` 으로 넣는 이유다. `run()` 의 `{ changes, lastInsertRowid }` 는 bigint 가 아니라 number 로 온다.
+
+### 아직 부딪히지 않은 것들
+
+[github-stars-to-sqlite](https://github.com/cbcruk/github-stars-to-sqlite) 가 같은 바인딩 위에서 먼저 밟은 것들이다. 이 저장소는 적재만 하므로 아직 해당되지 않지만, `.db` 를 읽는 쪽이 생기면 그대로 걸린다.
+
+SQL 안의 문자열 리터럴은 홑따옴표로 쓴다. `node:sqlite` 는 큰따옴표를 컬럼명으로 해석한다 — JSON 경로(`$.heartRate`)도 마찬가지다.
+
+`get()`/`all()` 이 돌려주는 null 프로토타입 객체는 직렬화 경계를 못 넘는다. RSC 에서 클라이언트 컴포넌트로 넘기면 막히므로 `.map((r) => ({ ...r }))` 로 평범한 객체로 바꿔서 넘긴다.
+
+읽기 전용 파일시스템(Vercel 함수 등)에서는 `new DatabaseSync(\`file:\${path}?immutable=1\`, { readOnly: true })` 로 연다. 그렇게 하지 않으면 SQLite 가 `-shm`/`-wal` 을 만들려다 실패한다. 대신 이 모드는 `-wal` 을 읽지 않으므로, 적재 후 `PRAGMA wal_checkpoint(TRUNCATE)` 로 접어 두는 것이 정확성 조건이 된다.
 
 ## 범위에 대한 미결
 
