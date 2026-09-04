@@ -3,7 +3,7 @@
 `.fit` 파일(Garmin/Wahoo/Suunto/Zwift)을 SQLite 하나에 적재한다. 적재까지가 이 저장소의 책임이고, 분석은 만들어진 `.db` 를 입력으로 받는 쪽에서 한다.
 
 ```bash
-npm install
+pnpm install
 node src/cli.ts activities.db ~/Garmin/*.fit
 sqlite3 activities.db < sql/views.sql
 sqlite3 activities.db < sql/correct.sql   # 선택: GPS 아티팩트 보정
