@@ -1,4 +1,4 @@
-import { Database } from 'bun:sqlite'
+import { DatabaseSync } from 'node:sqlite'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS fit_file (
@@ -27,12 +27,12 @@ CREATE INDEX IF NOT EXISTS message_kind_ts ON message(kind, ts);
 CREATE INDEX IF NOT EXISTS message_file_kind ON message(file_id, kind, seq);
 `
 
-export function openDb(path: string): Database {
-  const db = new Database(path, { create: true })
-  // bun:sqlite 에는 better-sqlite3 의 .pragma() 헬퍼가 없다. exec 로 직접 건다.
+export function openDb(path: string): DatabaseSync {
+  // node:sqlite 에는 better-sqlite3 의 .pragma() 헬퍼가 없다. exec 로 직접 건다.
+  // foreign_keys 는 DatabaseSync 가 기본으로 켜므로 다시 걸지 않는다.
+  const db = new DatabaseSync(path)
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
-  db.exec('PRAGMA foreign_keys = ON')
   db.exec(SCHEMA)
   return db
 }

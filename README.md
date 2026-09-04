@@ -3,13 +3,13 @@
 `.fit` 파일(Garmin/Wahoo/Suunto/Zwift)을 SQLite 하나에 적재한다. 적재까지가 이 저장소의 책임이고, 분석은 만들어진 `.db` 를 입력으로 받는 쪽에서 한다.
 
 ```bash
-bun install
-bun src/cli.ts activities.db ~/Garmin/*.fit
+pnpm install
+node src/cli.ts activities.db ~/Garmin/*.fit
 sqlite3 activities.db < sql/views.sql
 sqlite3 activities.db < sql/correct.sql   # 선택: GPS 아티팩트 보정
 ```
 
-런타임은 Bun 이다. `.ts` 를 그대로 실행하므로 빌드 단계가 없고, SQLite 는 내장 `bun:sqlite` 를 쓰므로 네이티브 모듈 컴파일도 없다 — 의존성은 `@garmin/fitsdk` 하나뿐이다.
+런타임은 Node 24 이상이다. 타입 스트리핑이 기본으로 켜져 있어 `.ts` 를 그대로 실행하므로 빌드 단계가 없고, SQLite 는 내장 `node:sqlite` 를 쓰므로 네이티브 모듈 컴파일도 없다 — 의존성은 `@garmin/fitsdk` 하나뿐이다.
 
 ## 스키마
 
@@ -86,9 +86,18 @@ record_geo(file_id, seq, gps_m, odo_m, is_artifact, step_m, dist_fix)  -- PK (fi
 
 ## 멱등성
 
-`sha256` UNIQUE 가 기준이다. 같은 파일을 다시 넣으면 조용히 건너뛴다. 파일 하나의 적재 전체가 한 트랜잭션이라 중간에 실패해도 반쪽 데이터가 남지 않는다.
+`sha256` UNIQUE 가 기준이다. 같은 파일을 다시 넣으면 조용히 건너뛴다. 파일 하나의 적재 전체가 한 트랜잭션이라 중간에 실패해도 반쪽 데이터가 남지 않는다. 실패한 파일은 `fit_file` 에 `sha256` 이 남지 않으므로 다음 실행에서 다시 시도된다.
 
-CRC 실패는 적재를 막지 않는다. 실제 기기 파일 중 CRC가 어긋나도 내용은 멀쩡한 경우가 있어서, `integrity_ok` 에 기록만 하고 넣는다. 걸러내려면 질의에서 배제하면 된다.
+이 보장에는 명시적인 처리가 필요하다. SDK 의 `read()` 는 디코드 전체를 하나의 `try/catch` 로 감싸고 잡은 걸 `errors` 에 담은 뒤 `finally` 에서 정상 반환한다.
+
+```js
+catch (error) { errors.push(error); }
+finally { return { messages, profileVersion, errors }; }
+```
+
+`mesgListener` 에서 던진 것도 같은 자리에서 삼켜진다. 그대로 두면 INSERT 실패가 '디코드 경고 1건' 으로 둔갑하고, `read()` 가 정상 반환하니 트랜잭션은 커밋된다 — 반쪽 파일이 `imported` 로 남고 `sha256` 때문에 재실행 시 건너뛰어져 영영 복구되지 않는다. 그래서 `src/ingest.ts` 는 리스너 안에서 자기 예외를 직접 잡아 두고 `read()` 가 끝난 뒤 다시 던진다.
+
+CRC 실패는 적재를 막지 않는다. 실제 기기 파일 중 CRC가 어긋나도 내용은 멀쩡한 경우가 있어서, `integrity_ok` 에 기록만 하고 넣는다. 걸러내려면 질의에서 배제하면 된다. 디코드 경고도 마찬가지로 관용한다 — 위 처리는 적재 쪽 실패에만 걸린다.
 
 ## 저장 비용
 
@@ -116,29 +125,33 @@ FROM h GROUP BY sid ORDER BY fade_pct DESC;
 `.fit` 없이 확인하려면 SDK의 `Encoder` 로 합성 파일을 만든다. `make-fixture.ts` 가 후반 15% 감속이 들어간 30분 러닝을 생성한다.
 
 ```bash
-bun make-fixture.ts && bun src/cli.ts test.db fixture.fit
+node make-fixture.ts && node src/cli.ts test.db fixture.fit
 ```
 
 ## tsconfig 주의
 
-SDK의 `.d.ts` 가 확장자 없는 상대 import(`export * from './types/decoder'`)를 쓴다. `moduleResolution: "nodenext"` 는 이걸 해석하지 못해 `Decoder`, `Profile` 등이 전부 미해결로 뜬다. `"bundler"` 로 두면 된다 — 런타임은 Bun 의 트랜스파일러가 처리하므로 영향이 없다.
+SDK의 `.d.ts` 가 확장자 없는 상대 import(`export * from './types/decoder'`)를 쓴다. `moduleResolution: "nodenext"` 는 이걸 해석하지 못해 `Decoder`, `Profile` 등이 전부 미해결로 뜬다. `"bundler"` 로 두면 된다 — 런타임 해석은 Node 가 하므로 영향이 없다.
 
-## bun:sqlite 주의
+`erasableSyntaxOnly: true` 는 취향이 아니라 요건이다. Node 의 타입 스트리핑은 타입을 공백으로 덮어쓰기만 하므로 `enum` 이나 파라미터 프로퍼티처럼 코드를 생성해야 하는 문법은 실행되지 않는다. 이 플래그가 그런 문법을 `tsc` 단계에서 막는다. 상대 import 에 `.ts` 확장자를 그대로 쓰는 것도 마찬가지로 요건이다 — 확장자를 지우면 Node 가 찾지 못한다.
 
-`better-sqlite3` 에서 옮겨올 때 걸리는 곳이 둘 있다.
+## node:sqlite 주의
 
-`.pragma()` 헬퍼가 없다. `db.exec('PRAGMA journal_mode = WAL')` 로 직접 건다. `synchronous` 는 연결별 설정이라 `sqlite3` CLI 로 확인하면 CLI 자신의 기본값이 보인다 — 검증하려면 같은 연결 안에서 읽어야 한다. `journal_mode` 만 파일 헤더에 남는다.
+`bun:sqlite` / `better-sqlite3` 에서 옮겨올 때 걸리는 곳이 넷 있다.
 
-`prepare` 의 제네릭 순서가 반대다. better-sqlite3 는 `<Params, Result>`, bun 은 `<Result, Params>` 다.
+`.transaction()` 헬퍼가 없다. `src/ingest.ts` 에 `BEGIN`/`COMMIT`/`ROLLBACK` 을 직접 거는 래퍼를 뒀다. `db.isTransaction` 으로 진행 여부를 볼 수 있다.
+
+`.pragma()` 헬퍼도 없다. `db.exec('PRAGMA journal_mode = WAL')` 로 직접 건다. `synchronous` 는 연결별 설정이라 `sqlite3` CLI 로 확인하면 CLI 자신의 기본값이 보인다 — 검증하려면 같은 연결 안에서 읽어야 한다. `journal_mode` 만 파일 헤더에 남는다. `foreign_keys` 는 `DatabaseSync` 가 기본으로 켜므로 따로 걸지 않는다.
+
+`prepare` 에 제네릭이 없다. `get()` 결과가 `unknown` 이라 호출부에서 캐스팅한다. 반환되는 row 는 `null` 프로토타입 객체이고, 없으면 `undefined` 다.
 
 ```ts
-// better-sqlite3
-db.prepare<[string], { id: number }>('SELECT id FROM fit_file WHERE sha256 = ?')
 // bun:sqlite
-db.prepare<{ id: number }, [string]>('SELECT id FROM fit_file WHERE sha256 = ?')
+db.prepare<{ id: number }, [string]>('SELECT id FROM fit_file WHERE sha256 = ?').get(sha)
+// node:sqlite
+db.prepare('SELECT id FROM fit_file WHERE sha256 = ?').get(sha) as { id: number } | undefined
 ```
 
-`transaction()` 과 `run()` 의 `{ changes, lastInsertRowid }` 는 동일하게 동작하므로 `src/ingest.ts` 는 손대지 않아도 된다.
+바인딩 가능한 값은 `null`/number/bigint/string/`Uint8Array` 뿐이다. boolean 은 던진다 — `integrity_ok` 를 `1`/`0` 으로 넣는 이유다. `run()` 의 `{ changes, lastInsertRowid }` 는 bigint 가 아니라 number 로 온다.
 
 ## 범위에 대한 미결
 
