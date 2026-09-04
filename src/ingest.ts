@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import { Decoder, Stream, Profile } from '@garmin/fitsdk'
+import { tx } from './db.ts'
 import { normalize, epochOf } from './normalize.ts'
 
 const MESG_NAME: Record<number, string> = Profile.types.mesgNum
@@ -8,19 +9,6 @@ const MESG_NAME: Record<number, string> = Profile.types.mesgNum
 export type IngestResult =
   | { status: 'imported'; fileId: number; messages: number; integrityOk: boolean; errors: string[] }
   | { status: 'skipped'; fileId: number }
-
-/** node:sqlite 에는 better-sqlite3/bun 의 .transaction() 헬퍼가 없다. */
-function transaction<T>(db: DatabaseSync, fn: () => T): T {
-  db.exec('BEGIN')
-  try {
-    const out = fn()
-    db.exec('COMMIT')
-    return out
-  } catch (err) {
-    db.exec('ROLLBACK')
-    throw err
-  }
-}
 
 export function ingest(db: DatabaseSync, buf: Uint8Array, filename: string): IngestResult {
   const sha256 = createHash('sha256').update(buf).digest('hex')
@@ -44,7 +32,7 @@ export function ingest(db: DatabaseSync, buf: Uint8Array, filename: string): Ing
     INSERT INTO message (file_id, seq, kind, ts, data) VALUES (?, ?, ?, ?, ?)
   `)
 
-  return transaction(db, (): IngestResult => {
+  return tx(db, (): IngestResult => {
     // profile_version 은 read 이후에 알 수 있으므로 일단 NULL 로 넣고 갱신한다.
     const fileId = Number(
       insertFile.run(sha256, filename, buf.length, null, integrityOk ? 1 : 0).lastInsertRowid,
