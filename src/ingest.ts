@@ -1,3 +1,18 @@
+/**
+ * Decodes a FIT file and stores each of its messages as a row in SQLite.
+ *
+ * @example
+ * ```ts
+ * import { readFile } from 'node:fs/promises'
+ * import { openDb, ingest } from 'fit-to-sqlite'
+ *
+ * const db = openDb('activities.db')
+ * ingest(db, await readFile('run.fit'), 'run.fit')
+ * db.close()
+ * ```
+ *
+ * @module
+ */
 import { createHash } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import { Decoder, Stream, Profile } from '@garmin/fitsdk'
@@ -6,10 +21,54 @@ import { normalize, epochOf } from './normalize.ts'
 
 const MESG_NAME: Record<number, string> = Profile.types.mesgNum
 
+/** Outcome of an {@linkcode ingest} call, discriminated by `status`. */
 export type IngestResult =
-  | { status: 'imported'; fileId: number; messages: number; integrityOk: boolean; errors: string[] }
-  | { status: 'skipped'; fileId: number }
+  | {
+      /** The file was decoded and stored. */
+      status: 'imported'
+      /** The new `fit_file.id`. */
+      fileId: number
+      /** Number of rows written to `message`. */
+      messages: number
+      /** `false` when the CRC did not match; the file is stored regardless. */
+      integrityOk: boolean
+      /** Decode warnings from the SDK. Empty for a clean file. */
+      errors: string[]
+    }
+  | {
+      /** A file with the same SHA-256 was already stored; nothing was written. */
+      status: 'skipped'
+      /** The `fit_file.id` of the existing file. */
+      fileId: number
+    }
 
+/**
+ * Decodes a FIT file and stores it in one transaction, skipping files already stored.
+ *
+ * Files are identified by the SHA-256 of `buf`. A CRC mismatch or SDK decode
+ * warning does not stop ingestion; both are reported in the result instead.
+ * When this throws, nothing is left in the database, so retrying the same
+ * file is safe.
+ *
+ * @param db A connection from {@linkcode openDb}, which creates the schema.
+ * @param buf The complete contents of a `.fit` file.
+ * @param filename Recorded in `fit_file.filename` only; nothing is read from disk.
+ * @throws {Error} When `buf` is not a FIT file, or when writing a message fails.
+ *
+ * @example Import a directory
+ * ```ts
+ * import { readdir, readFile } from 'node:fs/promises'
+ * import { join } from 'node:path'
+ * import { openDb, ingest } from 'fit-to-sqlite'
+ *
+ * const db = openDb('activities.db')
+ * for (const name of await readdir('fit')) {
+ *   const r = ingest(db, await readFile(join('fit', name)), name)
+ *   if (r.status === 'imported' && !r.integrityOk) console.warn(`${name}: CRC mismatch`)
+ * }
+ * db.close()
+ * ```
+ */
 export function ingest(db: DatabaseSync, buf: Uint8Array, filename: string): IngestResult {
   const sha256 = createHash('sha256').update(buf).digest('hex')
 
