@@ -1,26 +1,76 @@
 # fit-to-sqlite
 
-`.fit` 파일(Garmin/Wahoo/Suunto/Zwift)을 SQLite 하나에 적재한다. 적재까지가 이 저장소의 책임이고, 분석은 만들어진 `.db` 를 입력으로 받는 쪽에서 한다.
+A Node library that loads `.fit` files (Garmin/Wahoo/Suunto/Zwift) into a single SQLite database. It takes the raw bytes, decodes them, and stores each message as one row. It does no analysis — that is the job of whatever reads the resulting `.db`.
 
-```bash
-pnpm install
-node src/cli.ts activities.db ~/Garmin/*.fit
-sqlite3 activities.db < sql/views.sql
-sqlite3 activities.db < sql/correct.sql   # 선택: GPS 아티팩트 보정
+```ts
+import { readFile } from 'node:fs/promises'
+import { openDb, ingest } from 'fit-to-sqlite'
+
+const db = openDb('activities.db')
+const r = ingest(db, await readFile('run.fit'), 'run.fit')
+// { status: 'imported', fileId: 1, messages: 1843, integrityOk: true, errors: [] }
+db.close()
 ```
 
-런타임은 Node 24 이상이다. 타입 스트리핑이 기본으로 켜져 있어 `.ts` 를 그대로 실행하므로 빌드 단계가 없고, SQLite 는 내장 `node:sqlite` 를 쓰므로 네이티브 모듈 컴파일도 없다 — 의존성은 `@garmin/fitsdk` 하나뿐이다.
+- Requires Node 24 or later. SQLite comes from the built-in `node:sqlite`.
+- The only dependency is `@garmin/fitsdk`; there are no native modules to compile.
+- Ingesting the same file twice skips it. Each file is loaded in a single transaction.
 
-## 스키마
+> Distribution status: not yet published to npm, and `package.json` has no `exports`. Node also does not type-strip `.ts` files inside `node_modules`, so consuming this as a package requires build output (`.js` + `.d.ts`). Until then, import `./src/db.ts` and `./src/ingest.ts` directly from within the repo.
 
-테이블은 둘뿐이다.
+## API
+
+### `openDb(path: string): DatabaseSync`
+
+Opens a `node:sqlite` `DatabaseSync` and creates the schema (`CREATE ... IF NOT EXISTS`, so calling it on an existing file is safe). Sets `journal_mode = WAL` and `synchronous = NORMAL`. The return value is a plain `DatabaseSync`, so you can query it directly; closing it is the caller's responsibility.
+
+You can pass a `DatabaseSync` you opened yourself to `ingest`, but only `openDb` creates the schema.
+
+### `ingest(db, buf, filename): IngestResult`
+
+Synchronous. `buf` is the full contents of a `.fit` file (`Uint8Array`, including `Buffer`). `filename` is only recorded in `fit_file.filename`; nothing is read from disk.
+
+```ts
+type IngestResult =
+  | { status: 'imported'; fileId: number; messages: number; integrityOk: boolean; errors: string[] }
+  | { status: 'skipped'; fileId: number }
+```
+
+- `skipped` — a file with the same `sha256` already exists. `fileId` is the existing row's id.
+- `imported` — `messages` is the number of messages stored; `errors` are the SDK's decode warnings as strings.
+- `integrityOk: false` — the CRC did not match, but the file was loaded anyway. Some real device files have a bad CRC with perfectly intact content, so this does not block ingestion. Exclude `integrity_ok = 0` in your queries if you want to filter them out.
+
+It throws in two cases: before decoding if the input is not a FIT file, and after rolling back if a write (INSERT) fails. Either way nothing is left in `fit_file`, so the next call will retry. Decode warnings do not throw; they are returned in `errors`.
+
+### `tx(db, fn)`
+
+Wraps `fn` in `BEGIN`/`COMMIT`, rolling back and rethrowing on error. It exists because `node:sqlite` has no `.transaction()` helper. Nesting is not supported — `ingest` already uses it internally, so wrapping an `ingest` call in `tx` issues `BEGIN` twice and fails.
+
+### CLI
+
+`src/cli.ts` is a thin wrapper around the API above. It prints a result per file plus totals, and keeps going when an individual file fails.
+
+```bash
+node src/cli.ts activities.db ~/Garmin/*.fit
+```
+
+## Output schema
+
+These two tables are what the library guarantees.
 
 ```
 fit_file(id, sha256 UNIQUE, filename, bytes, profile_version, integrity_ok, imported_at)
 message(file_id, seq, kind, ts, data JSON)  -- PK (file_id, seq), WITHOUT ROWID
 ```
 
-메시지 하나가 row 하나고, 본문은 FIT 프로파일 필드명 그대로의 JSON이다. 어떤 필드를 컬럼으로 승격할지 미리 정하지 않는다. 질의를 몇 번 돌려서 실제 쓰는 필드가 드러난 다음 `sql/views.sql` 에 뷰로 굳히고, 그래도 느리면 생성 컬럼으로 승격한다. 셋 다 재적재가 필요 없다.
+| Column | Meaning |
+| --- | --- |
+| `message.seq` | Order of appearance within the file, regardless of message type (starting at 0) |
+| `message.kind` | The FIT profile message name as-is, in camelCase — `record`, `session`, `lap`, `fileId`, `deviceInfo`. Numbers missing from the profile become `unknown_<number>` |
+| `message.ts` | Unix epoch (seconds) taken from `timestamp`, then `startTime`, then `timeCreated`. `NULL` if none exists |
+| `message.data` | The message body as JSON, keyed by FIT profile field names |
+
+No fields are promoted to columns up front. Once real queries reveal which fields matter, freeze them into views; if that is still too slow, promote them to generated columns. Neither requires re-ingesting.
 
 ```sql
 ALTER TABLE message ADD COLUMN hr INTEGER
@@ -28,84 +78,70 @@ ALTER TABLE message ADD COLUMN hr INTEGER
 CREATE INDEX message_hr ON message(kind, hr) WHERE kind = 'record';
 ```
 
-### `seq` 가 하는 일
+`kind` is kept in camelCase rather than converted to snake_case so the FIT profile documentation can be used directly as a lookup key.
 
-SDK가 돌려주는 `messages` 트리는 타입별로 묶여 있어서 파일 내 상대 순서를 잃는다. 이 구현은 `mesgListener` 로 받아 타입 무관 등장 순서를 `seq` 에 남긴다. FIT은 lap 을 자기 session 앞에 쓰므로, 이 순서만 있으면 lap↔session 관계를 적재 시점에 FK로 풀지 않고 나중에 뷰에서 복원할 수 있다.
+### Recovering message relationships with `seq`
+
+The `messages` tree returned by the SDK is grouped by type, which loses the relative order within the file. This library receives messages through `mesgListener` and records their order of appearance in `seq`. Since FIT writes each lap before its session, the lap↔session relationship can be recovered at query time instead of being resolved into a foreign key during ingestion.
 
 ```sql
 SELECT (SELECT min(s.seq) FROM message s
-         WHERE s.file_id = l.file_id AND s.kind='session' AND s.seq > l.seq) AS session_seq
-FROM message l WHERE l.kind='lap';
+         WHERE s.file_id = l.file_id AND s.kind = 'session' AND s.seq > l.seq) AS session_seq
+FROM message l WHERE l.kind = 'lap';
 ```
 
-`kind` 는 FIT 프로파일 이름 그대로 camelCase다 — `record`, `session`, `lap`, `fileId`, `deviceInfo`. 스네이크로 바꾸지 않았다. 프로파일 문서를 그대로 조회 키로 쓸 수 있는 편이 낫다.
+### What `data` normalizes
 
-## 정규화 범위
+With its default options, `@garmin/fitsdk`'s `Decoder.read()` already applies scale/offset, converts enums to strings, omits invalid fields, converts FIT epochs to `Date`, and expands components. The library adds only two things:
 
-`@garmin/fitsdk` 의 `Decoder.read()` 기본 옵션이 scale/offset 적용, enum→문자열, invalid→필드 생략, FIT epoch→`Date`, component 전개를 이미 처리한다. 직접 손대는 건 `src/normalize.ts` 의 두 가지뿐이다.
+1. Adds `lat`/`lon` (degrees) from `positionLat`/`positionLong` (semicircles)
+2. When `enhancedSpeed`/`enhancedAltitude`/`enhancedAvgSpeed`/`enhancedMaxSpeed` are present, overwrites `speed`/`altitude`/`avgSpeed`/`maxSpeed` with them
 
-1. `positionLat`/`positionLong` 은 semicircles → `lat`/`lon` (degrees) 추가
-2. `enhancedSpeed`/`enhancedAltitude` 등이 있으면 `speed`/`altitude` 로 덮어씀
+Original keys are never removed; only derived keys are added. `Date` values go through `JSON.stringify` and are stored as ISO strings.
 
-원본 키는 지우지 않는다. 파생 키만 추가한다.
-
-`invalid→필드 생략` 은 스칼라 필드에만 해당한다. 배열 필드는 슬롯이 `null` 로 남는다.
+"Invalid fields are omitted" applies only to scalar fields. Array fields keep `null` in invalid slots.
 
 ```json
-{"time":[0.774,0.809,0.77,null,null]}   // hrv 메시지
+{"time":[0.774,0.809,0.77,null,null]}   // hrv message
 ```
 
-`json_each` 로 펼칠 때 `WHERE value IS NOT NULL` 을 빠뜨리면 개수가 부풀려진다.
+If you expand them with `json_each`, forgetting `WHERE value IS NOT NULL` inflates counts.
 
-## GPS 아티팩트 보정
+### Storage cost
 
-`sql/correct.sql` 은 선택 단계다. 코스에 상공이 가리는 지점(교량 하부 등)이 있으면 GPS 가 끊겼다 복귀하면서 기기 오도미터가 20~30m 를 한 번에 더한다. 그 순간 속도와 케이던스는 전혀 변하지 않으므로 실제로 뛴 거리가 아니다.
+For a 30-minute 1 Hz run (1,800 records), record JSON averages 273 bytes, and a 48 KB `.fit` becomes a 680 KB `.db` — roughly 14×, because key strings repeat on every row. At 300 activities a year that stays under 200 MB, which is fine for local analysis. By the time the ratio becomes a problem, you will already know which fields to promote.
 
-```
-seq 68  21:10:39  GPS 없음       오도 3.3m   속도 2.21  케이던스 85
-seq 69  21:10:41  GPS 복귀       오도 4.4m   속도 2.21  케이던스 85
-seq 70  21:10:42  GPS 3.1m      오도 2.2m   속도 2.21  케이던스 85
-seq 71  21:10:44  GPS 4.1m      오도 20.6m  속도 2.21  케이던스 85   <- 점프
-```
+## Ingestion guarantees and implementation notes
 
-20.6m 를 2초에 갔다면 10.3 m/s 다. 케이던스가 85 에서 미동도 않는다.
+Idempotency is keyed on the `sha256` UNIQUE constraint, and each file is loaded in a single transaction, so a mid-load failure never leaves partial data behind.
 
-판정 기준은 `오도미터 증분 > GPS 이동거리 × 2` 이면서 `초과분 > 5m` 다. 판정된 구간만 GPS 이동거리로 대체하고 나머지는 오도미터를 그대로 쓴다 — 정상 구간에서는 둘이 이미 일치하기 때문이다. GPS 가 없는 레코드나 첫 레코드는 판정하지 않는다.
-
-원본은 `message` 에 손대지 않고 파생값만 `record_geo` 에 쌓는다. 기준이 바뀌면 `correct.sql` 만 다시 실행하면 되고 재적재는 필요 없다.
-
-```
-record_geo(file_id, seq, gps_m, odo_m, is_artifact, step_m, dist_fix)  -- PK (file_id, seq)
-```
-
-`trackpoint_fix` 는 `trackpoint` 에 위 컬럼을 덧붙인 것이고, `activity_fix` 는 원본/보정 거리와 페이스를 나란히 낸다. 어느 쪽을 쓸지는 질의에서 고른다.
-
-보정은 보수적이다. 판정된 점프만 걷어내므로 GPS 잡음으로 인한 일반적인 과대계상은 남는다. 실측에서 보정값은 원본과 GPS 경로합 사이에 위치했다.
-
-합성 픽스처는 아티팩트 0건으로 거리가 원본과 완전히 같다. 깨끗한 데이터를 건드리지 않는지 확인하는 회귀 가드로 쓴다.
-
-## 멱등성
-
-`sha256` UNIQUE 가 기준이다. 같은 파일을 다시 넣으면 조용히 건너뛴다. 파일 하나의 적재 전체가 한 트랜잭션이라 중간에 실패해도 반쪽 데이터가 남지 않는다. 실패한 파일은 `fit_file` 에 `sha256` 이 남지 않으므로 다음 실행에서 다시 시도된다.
-
-이 보장에는 명시적인 처리가 필요하다. SDK 의 `read()` 는 디코드 전체를 하나의 `try/catch` 로 감싸고 잡은 걸 `errors` 에 담은 뒤 `finally` 에서 정상 반환한다.
+This guarantee needed explicit handling. The SDK's `read()` wraps the entire decode in one `try/catch`, collects whatever it catches into `errors`, and returns normally from `finally`.
 
 ```js
 catch (error) { errors.push(error); }
 finally { return { messages, profileVersion, errors }; }
 ```
 
-`mesgListener` 에서 던진 것도 같은 자리에서 삼켜진다. 그대로 두면 INSERT 실패가 '디코드 경고 1건' 으로 둔갑하고, `read()` 가 정상 반환하니 트랜잭션은 커밋된다 — 반쪽 파일이 `imported` 로 남고 `sha256` 때문에 재실행 시 건너뛰어져 영영 복구되지 않는다. 그래서 `src/ingest.ts` 는 리스너 안에서 자기 예외를 직접 잡아 두고 `read()` 가 끝난 뒤 다시 던진다.
+Anything thrown from `mesgListener` is swallowed in the same place. Left alone, an INSERT failure would masquerade as "1 decode warning" and the transaction would commit — a partial file would be recorded as `imported`, and because of `sha256` it would be skipped on every rerun and never recovered. So `src/ingest.ts` catches its own exceptions inside the listener and rethrows them after `read()` returns.
 
-CRC 실패는 적재를 막지 않는다. 실제 기기 파일 중 CRC가 어긋나도 내용은 멀쩡한 경우가 있어서, `integrity_ok` 에 기록만 하고 넣는다. 걸러내려면 질의에서 배제하면 된다. 디코드 경고도 마찬가지로 관용한다 — 위 처리는 적재 쪽 실패에만 걸린다.
+## Optional: SQL extensions
 
-## 저장 비용
+The two files in `sql/` sit outside the library API. Run them directly against an ingested `.db`.
 
-30분 1Hz 러닝(record 1,800개) 기준 record JSON이 평균 273바이트, 원본 `.fit` 48KB → `.db` 680KB. 대략 14배다. 키 문자열이 row마다 반복되는 값이고, 연 300개 활동이면 200MB 안쪽이라 로컬 분석용으로는 문제되지 않는다. 이 비율이 부담스러워지는 시점이면 이미 어떤 필드를 승격할지 알고 있을 것이다.
+```bash
+sqlite3 activities.db < sql/views.sql
+sqlite3 activities.db < sql/correct.sql   # requires views.sql first
+```
 
-## 예시 질의
+### `views.sql`
 
-`sql/views.sql` 적용 후, 전/후반 평균 속도 차이:
+Common query patterns frozen into views. They can be dropped or redefined at any time.
+
+- `activity` — `session` messages: sport, start time, duration, distance, average speed/heart rate, ascent
+- `trackpoint` — `record` messages: position, altitude, distance, speed, heart rate, cadence, power
+- `lap` — `lap` messages with their owning `session_seq`
+
+First-half vs. second-half average speed:
 
 ```sql
 WITH a AS (SELECT file_id, seq, start_ts, timer_s FROM activity),
@@ -120,56 +156,68 @@ SELECT sid,
 FROM h GROUP BY sid ORDER BY fade_pct DESC;
 ```
 
-## 테스트 픽스처
+### `correct.sql` — GPS artifact correction
 
-`.fit` 없이 확인하려면 SDK의 `Encoder` 로 합성 파일을 만든다. `make-fixture.ts` 가 후반 15% 감속이 들어간 30분 러닝을 생성한다.
+When a course passes under something that blocks the sky (such as the underside of a bridge), GPS drops out and then reacquires, and the device odometer adds 20–30 m in a single step. Speed and cadence don't change at all at that moment, so it is not distance actually covered.
+
+```
+seq 68  21:10:39  no GPS        odo 3.3m   speed 2.21  cadence 85
+seq 69  21:10:41  GPS back      odo 4.4m   speed 2.21  cadence 85
+seq 70  21:10:42  GPS 3.1m      odo 2.2m   speed 2.21  cadence 85
+seq 71  21:10:44  GPS 4.1m      odo 20.6m  speed 2.21  cadence 85   <- jump
+```
+
+A step is flagged when `odometer delta > GPS distance × 2` and `excess > 5 m`. Only flagged steps are replaced with the GPS distance; everything else keeps the odometer value. Records without GPS and the first record are never flagged.
+
+The original `message` table is untouched; derived values go into `record_geo`. If the criteria change, just rerun `correct.sql`.
+
+```
+record_geo(file_id, seq, gps_m, odo_m, is_artifact, step_m, dist_fix)  -- PK (file_id, seq)
+```
+
+- `trackpoint_fix` — `trackpoint` with the columns above appended
+- `activity_fix` — raw and corrected distance and pace side by side
+
+The correction is conservative. It only removes flagged jumps, so ordinary overcounting from GPS noise remains. In real data, corrected values fell between the raw value and the summed GPS track.
+
+## Reading the `.db` with `node:sqlite`
+
+Things that trip up anyone used to `bun:sqlite` / `better-sqlite3`. Some of these were first hit by [github-stars-to-sqlite](https://github.com/cbcruk/github-stars-to-sqlite) on the same bindings.
+
+- There are no `.transaction()` or `.pragma()` helpers. Use `tx()` for transactions and `db.exec()` for PRAGMAs. `DatabaseSync` enables `foreign_keys` by default.
+- `synchronous` is a per-connection setting, so checking it with the `sqlite3` CLI shows the CLI's own default. Only `journal_mode` persists in the file header.
+- `prepare` has no generics. `get()` returns `unknown`, so cast at the call site. Returned rows are `null`-prototype objects, and a missing row is `undefined`.
+
+  ```ts
+  db.prepare('SELECT id FROM fit_file WHERE sha256 = ?').get(sha) as { id: number } | undefined
+  ```
+
+- Only `null`/number/bigint/string/`Uint8Array` can be bound. Booleans throw — which is why `integrity_ok` is stored as `1`/`0`. `run()` returns `{ changes, lastInsertRowid }` as numbers.
+- Use single quotes for string literals in SQL. Double quotes are parsed as identifiers — JSON paths (`'$.heartRate'`) included.
+- `null`-prototype objects can't cross serialization boundaries. When passing rows from RSC to a client component, convert them with `.map((r) => ({ ...r }))`.
+- On read-only filesystems (such as Vercel functions), open with `` new DatabaseSync(`file:${path}?immutable=1`, { readOnly: true }) ``. Otherwise SQLite fails trying to create `-shm`/`-wal`. This mode does not read `-wal`, so folding it in with `PRAGMA wal_checkpoint(TRUNCATE)` after ingestion becomes a correctness requirement.
+
+## Development
 
 ```bash
+pnpm install
+pnpm typecheck
 node make-fixture.ts && node src/cli.ts test.db fixture.fit
 ```
 
-## tsconfig 주의
+`make-fixture.ts` uses the SDK's `Encoder` to synthesize a 30-minute run with a 15% slowdown in the second half. It contains zero artifacts, so running `correct.sql` on it must leave the distance identical to the original — a regression guard that clean data stays untouched.
 
-SDK의 `.d.ts` 가 확장자 없는 상대 import(`export * from './types/decoder'`)를 쓴다. `moduleResolution: "nodenext"` 는 이걸 해석하지 못해 `Decoder`, `Profile` 등이 전부 미해결로 뜬다. `"bundler"` 로 두면 된다 — 런타임 해석은 Node 가 하므로 영향이 없다.
+`.ts` files run directly through Node's type stripping with no build step, which puts three requirements on the tsconfig:
 
-`erasableSyntaxOnly: true` 는 취향이 아니라 요건이다. Node 의 타입 스트리핑은 타입을 공백으로 덮어쓰기만 하므로 `enum` 이나 파라미터 프로퍼티처럼 코드를 생성해야 하는 문법은 실행되지 않는다. 이 플래그가 그런 문법을 `tsc` 단계에서 막는다. 상대 import 에 `.ts` 확장자를 그대로 쓰는 것도 마찬가지로 요건이다 — 확장자를 지우면 Node 가 찾지 못한다.
+- `moduleResolution: "bundler"` — the SDK's `.d.ts` uses extensionless relative imports (`export * from './types/decoder'`), which `"nodenext"` cannot resolve, leaving `Decoder`, `Profile`, etc. unresolved. Runtime resolution is done by Node, so this has no runtime effect.
+- `erasableSyntaxOnly: true` — type stripping only blanks out types, so syntax that generates code, such as `enum` or parameter properties, won't run. This flag rejects it at `tsc` time.
+- Relative imports keep their `.ts` extension. Drop it and Node can't find the file.
 
-## node:sqlite 주의
+## Open question: scope boundary
 
-`bun:sqlite` / `better-sqlite3` 에서 옮겨올 때 걸리는 곳이 넷 있다.
+`correct.sql` is interpretation, not ingestion, so it straddles this library's boundary. For now it is an optional step outside the API, kept separate and non-destructive to the original data.
 
-`.transaction()` 헬퍼가 없다. `src/db.ts` 에 `BEGIN`/`COMMIT`/`ROLLBACK` 을 직접 거는 `tx()` 를 뒀다. `db.isTransaction` 으로 진행 여부를 볼 수 있다.
+- Coupling ingestion and correction via an `ingest` option or a CLI `--correct` flag is on hold. It would be convenient, but it mixes ingestion and interpretation in a single call.
+- Whether per-bridge artifact rates (A 21–41%, B 0–16%) correlate with time of day or weather needs more files to tell, and is clearly the job of whatever consumes the `.db`.
 
-`.pragma()` 헬퍼도 없다. `db.exec('PRAGMA journal_mode = WAL')` 로 직접 건다. `synchronous` 는 연결별 설정이라 `sqlite3` CLI 로 확인하면 CLI 자신의 기본값이 보인다 — 검증하려면 같은 연결 안에서 읽어야 한다. `journal_mode` 만 파일 헤더에 남는다. `foreign_keys` 는 `DatabaseSync` 가 기본으로 켜므로 따로 걸지 않는다.
-
-`prepare` 에 제네릭이 없다. `get()` 결과가 `unknown` 이라 호출부에서 캐스팅한다. 반환되는 row 는 `null` 프로토타입 객체이고, 없으면 `undefined` 다.
-
-```ts
-// bun:sqlite
-db.prepare<{ id: number }, [string]>('SELECT id FROM fit_file WHERE sha256 = ?').get(sha)
-// node:sqlite
-db.prepare('SELECT id FROM fit_file WHERE sha256 = ?').get(sha) as { id: number } | undefined
-```
-
-바인딩 가능한 값은 `null`/number/bigint/string/`Uint8Array` 뿐이다. boolean 은 던진다 — `integrity_ok` 를 `1`/`0` 으로 넣는 이유다. `run()` 의 `{ changes, lastInsertRowid }` 는 bigint 가 아니라 number 로 온다.
-
-### 아직 부딪히지 않은 것들
-
-[github-stars-to-sqlite](https://github.com/cbcruk/github-stars-to-sqlite) 가 같은 바인딩 위에서 먼저 밟은 것들이다. 이 저장소는 적재만 하므로 아직 해당되지 않지만, `.db` 를 읽는 쪽이 생기면 그대로 걸린다.
-
-SQL 안의 문자열 리터럴은 홑따옴표로 쓴다. `node:sqlite` 는 큰따옴표를 컬럼명으로 해석한다 — JSON 경로(`$.heartRate`)도 마찬가지다.
-
-`get()`/`all()` 이 돌려주는 null 프로토타입 객체는 직렬화 경계를 못 넘는다. RSC 에서 클라이언트 컴포넌트로 넘기면 막히므로 `.map((r) => ({ ...r }))` 로 평범한 객체로 바꿔서 넘긴다.
-
-읽기 전용 파일시스템(Vercel 함수 등)에서는 `new DatabaseSync(\`file:\${path}?immutable=1\`, { readOnly: true })` 로 연다. 그렇게 하지 않으면 SQLite 가 `-shm`/`-wal` 을 만들려다 실패한다. 대신 이 모드는 `-wal` 을 읽지 않으므로, 적재 후 `PRAGMA wal_checkpoint(TRUNCATE)` 로 접어 두는 것이 정확성 조건이 된다.
-
-## 범위에 대한 미결
-
-`sql/correct.sql` 은 이 저장소의 책임 경계에 걸쳐 있다. 적재가 아니라 해석이기 때문이다. 지금은 선택 단계이자 별도 파일로 두고 원본을 건드리지 않는 형태로 분리해 두었지만, 경계를 어디에 그을지는 정하지 않았다.
-
-미뤄둔 것들:
-
-- `cli.ts` 에 `--correct` 플래그를 두어 적재와 동시에 보정하는 안. 편하지만 적재와 해석을 한 명령에 묶게 되므로 보류한다.
-- 다리별 아티팩트 발생률(A 21~41%, B 0~16%)이 시간대나 날씨와 상관있는지. 파일이 더 쌓여야 볼 수 있고, 이건 명백히 `.db` 를 입력으로 받는 쪽의 일이다.
-
-판단이 서기 전까지 `correct.sql` 은 수동 단계로 남긴다. 돌리지 않으면 `record_geo` 가 없을 뿐 나머지는 그대로 동작한다.
+If `correct.sql` is never run, `record_geo` simply doesn't exist and everything else works as before.
